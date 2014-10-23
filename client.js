@@ -1,4 +1,5 @@
 var net = require('net');
+var tls = require('tls');
 var url = require('url');
 var EventEmitter = require('events').EventEmitter;
 
@@ -20,6 +21,9 @@ var HeaderHostTransformer = function(opts) {
 
     var self = this;
     self.host = opts.host || 'localhost';
+
+    self.host = 't.qurio.co:3001';
+
     self.replaced = false;
 }
 util.inherits(HeaderHostTransformer, Transform);
@@ -28,10 +32,11 @@ HeaderHostTransformer.prototype._transform = function (chunk, enc, cb) {
     var self = this;
     chunk = chunk.toString();
 
+    console.log('HeaderHostTransformer transforming:\n', chunk);
     // after replacing the first instance of the Host header
     // we just become a regular passthrough
     if (!self.replaced) {
-        self.push(chunk.replace(/(\r\nHost: )\S+/, function(match, $1) {
+        self.push(chunk = chunk.replace(/(\r\nHost: )\S+/, function(match, $1) {
             self.replaced = true;
             return $1 + self.host;
         }));
@@ -39,6 +44,8 @@ HeaderHostTransformer.prototype._transform = function (chunk, enc, cb) {
     else {
         self.push(chunk);
     }
+
+    console.log('to:\n', chunk);
 
     cb();
 };
@@ -51,6 +58,11 @@ var TunnelCluster = function(opt) {
 
     var self = this;
     self._opt = opt;
+
+    if (/^https?:\/\//i.test(opt.local_host)) {
+        self._opt.connectSecurely = /^https:\/\//i.test(opt.local_host);
+        self._opt.local_host = opt.local_host.replace(/^https?:\/\//i, '')
+    }
 
     EventEmitter.call(self);
 };
@@ -68,6 +80,8 @@ TunnelCluster.prototype.open = function() {
 
     var local_host = opt.local_host || 'localhost';
     var local_port = opt.local_port;
+
+    var connectSecurely = opt.connectSecurely;
 
     debug('establishing tunnel %s:%s <> %s:%s', local_host, local_port, remote_host, remote_port);
 
@@ -102,13 +116,24 @@ TunnelCluster.prototype.open = function() {
         debug('connecting locally to %s:%d', local_host, local_port);
         remote.pause();
 
-        // connection to local http server
+        // connection to local https/http server
         var local = net.connect({
             host: local_host,
             port: local_port
         });
+        if (connectSecurely) {
+            var secureStream = tls.connect({
+                socket: local,
+                ca: opt.ca,
+                key: opt.key,
+                cert: opt.cert,
+                requestCert: true,
+                rejectUnauthorized: false
+            });
+        }
 
         function remote_close() {
+            console.log('remote close');
             debug('remote close');
             self.emit('dead');
             local.end();
@@ -120,6 +145,7 @@ TunnelCluster.prototype.open = function() {
         // multiple local connections impossible. We need a smarter way to scale
         // and adjust for such instances to avoid beating on the door of the server
         local.once('error', function(err) {
+            console.log('local error', err.message);
             debug('local error %s', err.message);
             local.end();
 
@@ -133,7 +159,15 @@ TunnelCluster.prototype.open = function() {
             setTimeout(conn_local, 1000);
         });
 
-        local.once('connect', function() {
+        function connectionEstablished() {
+            if (connectSecurely) {
+                if (secureStream.authorized) {
+                  console.log("Connection authorized by a Certificate Authority.");
+                } else {
+                  console.log("Connection not authorized: " + secureStream.authorizationError);
+                }
+            }
+            console.log((connectSecurely ? 'securely ' : '') + 'connected locally to '+local_host);
             debug('connected locally');
             remote.resume();
 
@@ -146,13 +180,49 @@ TunnelCluster.prototype.open = function() {
                 stream = remote.pipe(HeaderHostTransformer({ host: opt.local_host }));
             }
 
-            stream.pipe(local).pipe(remote);
+            // stream.pipe(local).pipe(remote);
+
+            remote.readable = true;
+            remote.on('data', function(data) {
+              // console.log('Sending data from remote to local:', data.toString());
+              var ready = local.write(data);
+              if (ready === false) {
+                this.pause();
+                local.once('drain', this.resume.bind(this));
+              }
+            });
+            remote.on('end', function() {
+              local.end()
+            });
+
+            local.readable = true;
+            local.on('data', function(data) {
+              // console.log('Sending data from local to remote:', data.toString());
+              var ready = remote.write(data);
+              if (ready === false) {
+                this.pause();
+                remote.once('drain', this.resume.bind(this));
+              }
+            });
+            local.on('end', function() {
+              local.end()
+            });
+
+            remote.write('testing writing to remote...');
 
             // when local closes, also get a new remote
             local.once('close', function(had_error) {
+                debugger;
+                console.log('local connection closed:', had_error)
                 debug('local connection closed [%s]', had_error);
             });
-        });
+        }
+
+        if (connectSecurely) {
+            secureStream.once('secureConnect', connectionEstablished);
+        } else {
+            local.once('connect', connectionEstablished);
+        }
     }
 
     // tunnel is considered open when remote connects
